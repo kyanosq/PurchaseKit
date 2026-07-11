@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # macos-15 runner image carries Xcode 16.4 (default), the iOS 18.5 Simulator runtime,
+    # and "iPhone 16 Pro" — none of which form the FB22237318-affected combination
+    # (iOS 26.5 Simulator runtime + Xcode 26.5). The runner is nevertheless headless:
+    # Product.purchase() has no UI scene anchor there, so CI runs the deterministic layer
+    # plus the nine StoreKit integration checks that do not present a purchase sheet.
+    runs-on: macos-15
+    env:
+      # Pin the toolchain explicitly so the destination below resolves deterministically
+      # instead of depending on whichever Xcode the runner image happens to default to.
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Confirm toolchain
+        run: |
+          echo "Selected Xcode:"
+          xcodebuild -version
+          echo "Available iOS Simulator runtimes:"
+          xcrun simctl list runtimes | grep -i ios
+
+      - name: Resolve manifest
+        run: swift package dump-package > /dev/null
+
+      - name: Build and test (zero-failure, zero-skip gate)
+        run: |
+          set -eo pipefail
+          # Xcode 16.4 / iOS 18.5 Simulator / iPhone 16 Pro — the non-affected combination.
+          # -resultBundlePath captures TestResults.xcresult for the structured gate below;
+          # pipefail makes any non-zero xcodebuild exit (a failure) fail the step immediately.
+          xcodebuild -scheme PurchaseKit \
+            -destination 'platform=iOS Simulator,OS=18.5,name=iPhone 16 Pro' \
+            -resultBundlePath TestResults.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            -only-testing:PurchaseKitTests/PricingFormatterTests \
+            -only-testing:PurchaseKitTests/PurchaseCacheTests \
+            -only-testing:PurchaseKitTests/EntitlementStateResolverTests \
+            -only-testing:PurchaseKitTests/StoreKitManagerRestorePurchasesTests \
+            -only-testing:PurchaseKitTests/InAppPurchaseModelsTests \
+            -only-testing:PurchaseKitTests/PromotionalOfferTests \
+            -only-testing:PurchaseKitTests/PublicAPITests \
+            -only-testing:PurchaseKitTests/StoreKitConfigurationTests \
+            -only-testing:PurchaseKitTests/PurchaseCatalogTests \
+            -only-testing:PurchaseKitTests/StoreKitTestingPlatformTests \
+            -only-testing:PurchaseKitTests/PrivacyManifestTests \
+            -only-testing:PurchaseKitTests/StoreKitManagerIntegrationTests/testLoadProducts_Success \
+            -only-testing:PurchaseKitTests/StoreKitManagerIntegrationTests/testLoadProducts_ProductDetails \
+            -only-testing:PurchaseKitTests/StoreKitManagerIntegrationTests/testUserStatus_NewUser \
+            -only-testing:PurchaseKitTests/StoreKitManagerIntegrationTests/testGetFormattedPrice \
+            -only-testing:PurchaseKitTests/StoreKitManagerIntegrationTests/testGetPriceValue \
+            -only-testing:PurchaseKitTests/StoreKitManagerIntegrationTests/testCalculateYearlySavings \
+            -only-testing:PurchaseKitTests/StoreKitManagerIntegrationTests/testCanAccessProFeatures_NoPurchase \
+            -only-testing:PurchaseKitTests/StoreKitManagerIntegrationTests/testGetSubscriptionPeriod \
+            -only-testing:PurchaseKitTests/StoreKitManagerIntegrationTests/testGetIntroductoryOfferDetails \
+            test 2>&1 | tee test-output.log
+          # Structured zero-skip gate: the .xcresult summary is the authoritative source.
+          # Console-grep skip detection is replaced by parsing the JSON summary and requiring
+          # failedTests == 0 AND skippedTests == 0 AND passedTests == totalTestCount > 0.
+          xcrun xcresulttool get test-results summary --path TestResults.xcresult > summary.json
+          /usr/bin/python3 - <<'PY'
+          import json, sys
+          with open("summary.json") as f:
+              d = json.load(f)
+          failed = d.get("failedTests", -1)
+          skipped = d.get("skippedTests", -1)
+          passed = d.get("passedTests", -1)
+          total = d.get("totalTestCount", -1)
+          print(f"failedTests={failed} skippedTests={skipped} passedTests={passed} totalTestCount={total}")
+          if total <= 0:
+              print("::error::No tests executed (totalTestCount=0); the gate requires a non-empty run.")
+              sys.exit(1)
+          if failed != 0:
+              print(f"::error::failedTests={failed}; CI requires zero failures.")
+              sys.exit(1)
+          if skipped != 0:
+              print(f"::error::skippedTests={skipped}; CI requires zero skips.")
+              sys.exit(1)
+          if passed != total:
+              print(f"::error::passedTests={passed} != totalTestCount={total}.")
+              sys.exit(1)
+          print("Structured gate passed: zero failures, zero skips, all tests passed.")
+          PY
+
+      - name: Reject whitespace errors
+        run: git diff --check
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: TestResults.xcresult
+          path: TestResults.xcresult
