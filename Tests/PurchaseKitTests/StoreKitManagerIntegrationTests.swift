@@ -49,10 +49,18 @@ final class StoreKitManagerIntegrationTests: XCTestCase {
             probeIsEmpty: environmentProbe.isEmpty,
             runtimeVersion: StoreKitTestingPlatform.currentRuntimeVersion,
             simulator: StoreKitTestingPlatform.currentIsSimulator,
-            toolchainVersion: StoreKitTestingPlatform.currentToolchainVersion
+            toolchainVersion: StoreKitTestingPlatform.currentToolchainVersion,
+            hosted: StoreKitTestingPlatform.currentIsAppHosted
         ) {
         case .run:
             break
+        case .skipUnhosted:
+            throw XCTSkip("""
+                当前测试进程没有宿主 App（`swift test` / xctest CLI）：storekitd 不向无宿主进程下发 \
+                .storekit 配置，SKTestSession 创建成功但 Product.products 必然为空。这是构建方式的 \
+                结构性限制，不是回归——同一批断言在 Xcode / 模拟器的 app-hosted 运行下照常执行。 \
+                命令行 `swift test` 覆盖的是本包的纯逻辑层。
+                """)
         case .skipAffected:
             throw XCTSkip("""
                 StoreKit 测试配置未被 storekitd 应用：Product.products 在 SKTestSession 已创建后仍返回空。 \

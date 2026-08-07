@@ -35,7 +35,15 @@ final class StoreKitTestHelper {
     }
 
     /// 在测试 bundle、主 bundle 及其嵌套资源子包中查找 .storekit 配置文件。
+    ///
+    /// `Bundle.module` 必须排在最前：SwiftPM 命令行构建把资源包放在 `.xctest` 的**同级目录**
+    /// （`.build/<triple>/debug/PurchaseKit_PurchaseKitTests.bundle`），不在 `.xctest` 内部，
+    /// 因此下面那轮「向每个 bundle 要它自己 Resources 里的 .bundle」永远扫不到它。
+    /// `Bundle.module` 由 SwiftPM 为带资源的目标生成，在 Xcode 与命令行两种布局下都正确。
     private static func locateConfigurationFile(name: String) -> URL? {
+        if let url = Bundle.module.url(forResource: name, withExtension: "storekit") {
+            return url
+        }
         let bundles: [Bundle] = [Bundle(for: StoreKitTestHelper.self), Bundle.main] + Bundle.allBundles
         for bundle in bundles {
             if let url = bundle.url(forResource: name, withExtension: "storekit") {
@@ -159,6 +167,10 @@ enum StoreKitConfigProbeOutcome {
     case run
     /// 空探针 + 受影响的 iOS 26.5 模拟器运行时且构建工具链早于修复版本：跳过（已知平台缺陷）。
     case skipAffected
+    /// 空探针 + 当前测试进程没有宿主 App：`storekitd` 不向无宿主进程下发 `.storekit` 配置，
+    /// 这是 SwiftPM 命令行 `swift test` 的结构性限制，不是回归。同一批断言在 Xcode/模拟器
+    /// 的宿主运行下照常执行。
+    case skipUnhosted
     /// 空探针 + 其它任何组合：判为真实回归（资源路径/schema/product ID/StoreKit 设置问题）。
     case failRegression
 }
@@ -195,15 +207,22 @@ enum StoreKitTestingPlatform {
         return !isAtLeast(toolchainVersion, storeKitConfigPushFixedInToolchain)
     }
 
-    /// 纯函数：由探针、运行时与构建工具链决定集成层处置。可在不启动 StoreKit 的情况下做确定性
-    /// 回归：空探针仅在「受影响运行时 ∧ 受影响工具链」时跳过，其余一律判失败。
+    /// 纯函数：由探针、宿主环境、运行时与构建工具链决定集成层处置。可在不启动 StoreKit 的情况下
+    /// 做确定性回归：空探针只有两种被原谅的理由——**没有宿主 App**，或**受影响运行时 ∧ 受影响
+    /// 工具链**——其余一律判失败。
+    ///
+    /// `hosted` 默认 `true`，使既有调用点（都描述宿主模拟器场景）语义不变。
     static func outcome(
         probeIsEmpty: Bool,
         runtimeVersion: OperatingSystemVersion,
         simulator: Bool,
-        toolchainVersion: OperatingSystemVersion?
+        toolchainVersion: OperatingSystemVersion?,
+        hosted: Bool = true
     ) -> StoreKitConfigProbeOutcome {
         if !probeIsEmpty { return .run }
+        // 无宿主优先：它是比平台缺陷更根本、也更确定的解释——没有宿主 App 时
+        // `storekitd` 根本不会收到配置，与运行时版本无关。
+        if !hosted { return .skipUnhosted }
         let affected = isAffectedRuntime(runtimeVersion, simulator: simulator)
             && isAffectedToolchain(toolchainVersion)
         return affected ? .skipAffected : .failRegression
@@ -221,6 +240,13 @@ enum StoreKitTestingPlatform {
     /// 当前进程运行的 OS 版本（模拟器上即模拟器运行时的 iOS 版本）。
     static var currentRuntimeVersion: OperatingSystemVersion {
         ProcessInfo.processInfo.operatingSystemVersion
+    }
+
+    /// 当前测试进程是否有宿主 App。`swift test` / `xctest` CLI 下主 bundle 是 xctest 工具本身
+    /// （或干脆没有 bundle identifier）；Xcode 的 app-hosted 测试里主 bundle 是被测 App。
+    static var currentIsAppHosted: Bool {
+        guard let identifier = Bundle.main.bundleIdentifier else { return false }
+        return identifier != "com.apple.dt.xctest.tool"
     }
 
     /// 当前是否运行在模拟器上。

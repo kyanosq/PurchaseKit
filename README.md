@@ -7,7 +7,10 @@ PurchaseKit 把 StoreKit 2 的购买、恢复、订阅状态与权益判断收�
 
 - 单一 public product / target / 模块名：`PurchaseKit`。
 - 通过 Swift Package Manager 的 Git URL 安装。
-- 仅支持 iOS 17+（首发版本），使用 StoreKit 2 与 `Observation`。
+- 面向 iOS 17+，使用 StoreKit 2 与 `Observation`。清单自 0.2.0 起同时声明
+  macOS 14 / watchOS 10 / tvOS 17，与源码里一直写着的 `@available` 一致——目的是让
+  `swift build` / `swift test` 能在命令行跑起来（此前不能，见 [TESTING.md](TESTING.md)）。
+  **iOS 之外的平台可编译但未做端到端验证，不作为支持承诺。**
 - 不含 paywall UI、应用营销文案、analytics SDK、App Store 私钥或服务端收据验证。
 
 ## 能力
@@ -85,6 +88,7 @@ try await store.restorePurchases()
 - [ARCH.md](ARCH.md) — target 边界、依赖方向、权益 / 缓存 / 撤销 / 促销签名规则的唯一来源。
 - [TESTING.md](TESTING.md) — 测试分层、运行命令与「变更 → 验证」映射。
 - [DELIVERY.md](DELIVERY.md) — CI、版本策略、打标签与回滚流程。
+- [CHANGELOG.md](CHANGELOG.md) — 每个版本改了什么行为，以及仍未覆盖什么。
 - [AGENTS.md](AGENTS.md) — 自动化 agent 的最小约束。
 - [STOREKIT_TESTING_GUIDE.md](STOREKIT_TESTING_GUIDE.md) — StoreKit 集成测试的运行细节与已知限制。
 - [docs/feature-docs/entitlement-state.md](docs/feature-docs/entitlement-state.md) — 权益状态与访问矩阵。

@@ -1,10 +1,16 @@
 import Foundation
 import StoreKit
 import Combine
+import os
 import Observation
 #if canImport(UIKit)
 import UIKit
 #endif
+
+/// 发行版里也会执行的日志走统一日志系统，不走 stdout。与 `UserDefaultsProtocol` 一致：
+/// 可能暴露用户购买内容的字段按 `.private` 打点，不在设备日志里留下明文商品 ID。
+/// （`PurchaseCache` 的调试日志本就用 `#if DEBUG` 包住，这里补的是发行版也会跑的那些。）
+private let storeLog = Logger(subsystem: "PurchaseKit", category: "Store")
 
 // MARK: - Notification Names
 
@@ -215,7 +221,7 @@ public final class StoreKitManager {
             do {
                 try await loadProducts()
             } catch {
-                print("[StoreKitManager]Failed to load products during initialization: \(error)")
+                storeLog.error("Failed to load products during initialization: \(String(describing: error), privacy: .public)")
             }
             await restoreEntitlementsSilently()
             if self.purchaseCache.shouldValidateOnStartup() && !self.purchaseCache.isInLoginCooldown() {
@@ -408,35 +414,56 @@ public final class StoreKitManager {
     }
 
     private func processTransactionUpdate(_ result: VerificationResult<Transaction>) async {
+        guard let transaction = await verifiedTransactionSettlingUnverified(result) else { return }
+        storeLog.info("Transaction update: \(transaction.productID, privacy: .private)")
+        if let revocationDate = transaction.revocationDate {
+            await handleRefundOrRevocation(transaction: transaction, revocationDate: revocationDate)
+        }
         do {
-            let transaction: Transaction = try checkVerified(result)
-            await MainActor.run {
-                print("[StoreKitManager] Transaction update: \(transaction.productID)")
-            }
-            if let revocationDate = transaction.revocationDate {
-                await handleRefundOrRevocation(transaction: transaction, revocationDate: revocationDate)
-            }
-            do {
-                try await updateUserPurchases()
-            } catch {
-                let nsError = error as NSError
-                print("[StoreKitManager] Failed to refresh purchases after transaction update: domain=\(nsError.domain), code=\(nsError.code), message=\(nsError.localizedDescription)")
-            }
-            await updateUserStatus(refreshPurchases: false)
-            await transaction.finish()
+            try await updateUserPurchases()
         } catch {
             let nsError = error as NSError
-            print("[StoreKitManager] Failed to process transaction update: domain=\(nsError.domain), code=\(nsError.code), message=\(nsError.localizedDescription)")
+            storeLog.error("Failed to refresh purchases after transaction update: domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public)")
         }
+        await updateUserStatus(refreshPurchases: false)
+        await transaction.finish()
     }
-    
+
+    // MARK: - Verification
+
     private func checkVerified<T>(_ result: VerificationResult<T>) throws -> T {
         switch result {
         case .unverified: throw StoreError.failedVerification
         case .verified(let safe): return safe
         }
     }
-    
+
+    /// 逐条验证权益：单条验证失败只丢弃那一条，不中断整条枚举。策略见
+    /// `EntitlementVerification.verifiedOrSkipped`。
+    private func verifiedOrSkipped<T>(_ result: VerificationResult<T>) -> T? {
+        if case .unverified(_, let error) = result {
+            storeLog.error("Skipping unverified entitlement: \(String(describing: error), privacy: .public)")
+        }
+        return EntitlementVerification.verifiedOrSkipped(result)
+    }
+
+    /// 事务更新流专用：验证失败时按 `EntitlementVerification.shouldFinishUnverified`
+    /// 决定是否结束这笔交易，然后丢弃它（绝不授予权益）。
+    private func verifiedTransactionSettlingUnverified(
+        _ result: VerificationResult<Transaction>
+    ) async -> Transaction? {
+        switch result {
+        case .verified(let safe):
+            return safe
+        case .unverified(let unsafeTransaction, let error):
+            storeLog.error("Unverified transaction \(unsafeTransaction.productID, privacy: .private): \(String(describing: error), privacy: .public)")
+            if EntitlementVerification.shouldFinishUnverified(unsafeTransaction.productType) {
+                await unsafeTransaction.finish()
+            }
+            return nil
+        }
+    }
+
     // MARK: - Refund/revocation
     private func handleRefundOrRevocation(transaction: Transaction, revocationDate: Date) async {
         await MainActor.run {
@@ -496,31 +523,28 @@ public final class StoreKitManager {
         var seenLifetime = false
         var activeSubTransaction: Transaction?
         var observedSubscriptionIDs: Set<String> = []
-        do {
-            for await result in storeKitService.currentEntitlements() {
-                let transaction = try checkVerified(result)
-                // 已验证的撤销交易不授予任何权益，也不进入历史/活跃快照。
-                if transaction.revocationDate != nil { continue }
-                if transaction.productType == .autoRenewable {
-                    let isUnexpired = transaction.expirationDate.map { $0 > Date() } ?? true
-                    if isUnexpired {
-                        hasActiveSubscription = true
-                        if activeSubTransaction == nil { activeSubTransaction = transaction }
-                        if let offerType = transaction.offerType, case .introductory = offerType { isInTrial = true }
-                        observedSubscriptionIDs.insert(transaction.productID)
-                    } else {
-                        hasExpiredSubscription = true
-                    }
-                }
-                if transaction.productType == .nonConsumable {
-                    if lifetimeProductIDSet.contains(transaction.productID) {
-                        seenLifetime = true
-                    }
+        // 不再包 do/catch：逐条验证后这个循环不会抛，原先的 catch 只可能由
+        // `checkVerified` 触发，而那正是"一条坏交易废掉整次刷新"的入口。
+        for await result in storeKitService.currentEntitlements() {
+            guard let transaction = verifiedOrSkipped(result) else { continue }
+            // 已验证的撤销交易不授予任何权益，也不进入历史/活跃快照。
+            if transaction.revocationDate != nil { continue }
+            if transaction.productType == .autoRenewable {
+                let isUnexpired = transaction.expirationDate.map { $0 > Date() } ?? true
+                if isUnexpired {
+                    hasActiveSubscription = true
+                    if activeSubTransaction == nil { activeSubTransaction = transaction }
+                    if let offerType = transaction.offerType, case .introductory = offerType { isInTrial = true }
+                    observedSubscriptionIDs.insert(transaction.productID)
+                } else {
+                    hasExpiredSubscription = true
                 }
             }
-        } catch {
-            let result = handleStoreKitError(error)
-            if result.shouldFallbackToCache { hasActiveSubscription = !purchasedProductIDs.isEmpty }
+            if transaction.productType == .nonConsumable {
+                if lifetimeProductIDSet.contains(transaction.productID) {
+                    seenLifetime = true
+                }
+            }
         }
         await MainActor.run {
             // 仅在未过期（或无过期时间）时保留活跃交易。
@@ -578,7 +602,7 @@ public final class StoreKitManager {
             } else {
                 await MainActor.run { self.subscriptionGroupStatus = state }
             }
-        } catch { print("[StoreKitManager]Failed to update subscription group status: \(error)") }
+        } catch { storeLog.error("Failed to update subscription group status: \(String(describing: error), privacy: .public)") }
     }
 
     private func mapRenewalState(_ state: Product.SubscriptionInfo.RenewalState) -> RenewalState {
@@ -617,7 +641,7 @@ public final class StoreKitManager {
         if isInLoginCooldown { throw StoreError.userCancelled }
         var purchased: Set<String> = []
         for await result in storeKitService.currentEntitlements() {
-            let transaction = try checkVerified(result)
+            guard let transaction = verifiedOrSkipped(result) else { continue }
             if transaction.revocationDate == nil { purchased.insert(transaction.productID) }
         }
         await MainActor.run {
@@ -664,23 +688,25 @@ public final class StoreKitManager {
     // MARK: - Public API
     public func restoreEntitlementsSilently() async {
         var purchasedProducts: Set<String> = []
-        do {
-            for await result in storeKitService.currentEntitlements() {
-                let transaction = try checkVerified(result)
-                if transaction.revocationDate == nil {
-                    purchasedProducts.insert(transaction.productID)
-                }
+        // 原先这里的 catch → `handleOfflineValidation()` 只可能被 `checkVerified` 触发：
+        // `currentEntitlements` 是不抛的 AsyncStream，真正离线时它给出空序列而不是错误。
+        // 也就是说"一条 JWS 验证不过"曾被当成"设备离线"，整个账号退回缓存状态。
+        // 逐条跳过后这条路径不再存在，离线兜底仍由 `validatePurchasesWithFallback` 负责。
+        for await result in storeKitService.currentEntitlements() {
+            guard let transaction = verifiedOrSkipped(result) else { continue }
+            if transaction.revocationDate == nil {
+                purchasedProducts.insert(transaction.productID)
             }
-            await MainActor.run {
-                self.purchasedProductIDs = purchasedProducts
-                self.lastValidPurchases = purchasedProducts
-                self.lastValidationTime = Date()
-            }
-            // 先刷新订阅组状态，再经解析器计算用户状态与活跃交易（仅在未过期时保留）。
-            await updateSubscriptionGroupStatus()
-            await calculateUserStatusFromPurchases()
-            await updateOfferEligibility()
-        } catch { await handleOfflineValidation() }
+        }
+        await MainActor.run {
+            self.purchasedProductIDs = purchasedProducts
+            self.lastValidPurchases = purchasedProducts
+            self.lastValidationTime = Date()
+        }
+        // 先刷新订阅组状态，再经解析器计算用户状态与活跃交易（仅在未过期时保留）。
+        await updateSubscriptionGroupStatus()
+        await calculateUserStatusFromPurchases()
+        await updateOfferEligibility()
     }
     
     public func checkUserEligibility() async -> UserOfferEligibility {
@@ -890,7 +916,7 @@ public final class StoreKitManager {
             return statuses.first
         } catch {
             _ = handleStoreKitError(error)
-            print("[StoreKitManager]Failed to read subscription status: \(error)")
+            storeLog.error("Failed to read subscription status: \(String(describing: error), privacy: .public)")
             return nil
         }
     }
@@ -902,7 +928,7 @@ public final class StoreKitManager {
             return renewalInfo.willAutoRenew
         } catch {
             _ = handleStoreKitError(error)
-            print("[StoreKitManager]Failed to verify renewal info: \(error)")
+            storeLog.error("Failed to verify renewal info: \(String(describing: error), privacy: .public)")
             return false
         }
     }
@@ -1098,12 +1124,16 @@ public final class StoreKitManager {
     private func handlePurchaseResult(_ result: Product.PurchaseResult) async throws {
         switch result {
         case .success(let verification):
-            let transaction = try checkVerified(verification)
+            // 验证不过时同样要结束这笔交易再抛错：否则它会留在 `Transaction.updates` 里，
+            // 每次冷启动重投一遍必然失败的验证。用户仍会看到失败提示（`.failedVerification`）。
+            guard let transaction = await verifiedTransactionSettlingUnverified(verification) else {
+                throw StoreError.failedVerification
+            }
             do {
                 try await updateUserPurchases()
             } catch {
                 let nsError = error as NSError
-                print("[StoreKitManager] Failed to refresh purchases after successful purchase: domain=\(nsError.domain), code=\(nsError.code), message=\(nsError.localizedDescription)")
+                storeLog.error("Failed to refresh purchases after successful purchase: domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public)")
             }
             await updateUserStatus(refreshPurchases: false)
             await transaction.finish()
