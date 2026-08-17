@@ -308,7 +308,19 @@ public final class StoreKitManager {
         purchaseCache.shouldValidateOnStartup() && !purchaseCache.isInLoginCooldown()
     }
     
-    private func handleAppWillEnterForeground() async {
+    /// 回到前台时重新解析权益。**不调用 `AppStore.sync()`**。
+    ///
+    /// 这里原本先 `sync()` 再刷新，而 `sync()` 会弹 App Store 登录框。
+    /// `willEnterForeground` 在**冷启动**时也会发一次（`didFinishLaunching` 之后、
+    /// `didBecomeActive` 之前），下面那道节流只挡 6 小时——于是任何隔天打开 app 的
+    /// 老用户，一启动就被要求登录 App Store，谁也没点过「恢复购买」。
+    ///
+    /// StoreKit 2 的 `currentEntitlements` 本身就是最新的，`forceRefreshPurchases()`
+    /// 读它即可，无需 `sync()`。Apple 也明确 `AppStore.sync()` 只应由用户显式动作
+    /// 触发——现在它只剩 `restorePurchases()` 这一个调用点，也就是「恢复购买」按钮。
+    /// `internal` 而非 `private`：观察者的注册在 `#if canImport(UIKit)` 之下，
+    /// 而包的测试跑在 macOS 上——靠发通知来测会变成一条永远不执行的绿测试。
+    func handleAppWillEnterForeground() async {
         if purchaseCache.isInLoginCooldown() { return }
         guard purchaseCache.shouldCheckOnForeground() else { return }
         if let lastValidation = lastValidationTime {
@@ -318,7 +330,6 @@ public final class StoreKitManager {
         let cachedPurchases = purchaseCache.getLastValidPurchases()
         guard !cachedPurchases.isEmpty else { return }
         lastForegroundCheckTime = Date()
-        do { try await storeKitService.sync() } catch { _ = handleStoreKitError(error) }
         await forceRefreshPurchases()
     }
     

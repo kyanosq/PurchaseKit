@@ -186,9 +186,12 @@ final class StoreKitManagerRestorePurchasesTests: XCTestCase {
         XCTAssertEqual(calls, 2, "reloadProducts 应显式重新拉取商品，而不是沿用旧结果")
     }
 
+    /// 探针从 `sync()` 换成了 `currentEntitlements()`：回前台的刷新路径不再调
+    /// `AppStore.sync()`（那会弹登录框），而这条测试量的是「两次触发只跑一个任务」，
+    /// 和用哪个调用当计数器无关。继续数 sync 只会得到恒为 0 的空断言。
     func testStartPeriodicRefundCheck_DeduplicatesPendingTask() async throws {
         let cache = AlwaysCheckForegroundPurchaseCache()
-        let service = SyncCountingStoreKitService()
+        let service = CountingEntitlementsStoreKitService()
         let config = StoreKitConfiguration(
             namespace: "test.periodic_refund." + UUID().uuidString,
             maxOfflineGracePeriod: 3600,
@@ -217,9 +220,8 @@ final class StoreKitManagerRestorePurchasesTests: XCTestCase {
 
         try await Task.sleep(nanoseconds: 400_000_000)
 
-        let syncCount = await service.currentSyncCount()
         XCTAssertEqual(
-            syncCount,
+            cache.foregroundCheckWriteCount,
             1,
             "重复触发 startPeriodicRefundCheck 不应创建多个并发退款检查任务"
         )
@@ -813,6 +815,9 @@ private final class AlwaysCheckForegroundPurchaseCache: PurchaseCacheProtocol {
     private var validationTime: Date?
     private var loginRejectionTime: Date?
     private var foregroundCheckTime: Date?
+    /// 前台刷新的函数体每跑一遍恰好写一次它——数写入次数就是数「跑了几遍」，
+    /// 比数某个下游调用稳：下游一趟里读几次权益是实现细节。
+    private(set) var foregroundCheckWriteCount = 0
 
     func getLastValidPurchases() -> Set<String> { purchases }
     func setLastValidPurchases(_ purchases: Set<String>) { self.purchases = purchases }
@@ -823,7 +828,10 @@ private final class AlwaysCheckForegroundPurchaseCache: PurchaseCacheProtocol {
     func getLastLoginRejectionTime() -> Date? { loginRejectionTime }
     func setLastLoginRejectionTime(_ date: Date?) { loginRejectionTime = date }
     func getLastForegroundCheckTime() -> Date? { foregroundCheckTime }
-    func setLastForegroundCheckTime(_ date: Date?) { foregroundCheckTime = date }
+    func setLastForegroundCheckTime(_ date: Date?) {
+        foregroundCheckTime = date
+        foregroundCheckWriteCount += 1
+    }
     func clearAllCache() {
         purchases = []
         status = nil
