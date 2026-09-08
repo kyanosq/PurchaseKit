@@ -3,6 +3,19 @@
 遵循 [Semantic Versioning](https://semver.org/)。版本策略见 [DELIVERY.md](DELIVERY.md)：
 `0.x.y` 期间，任何公共 API、**行为**或持久化键的破坏性变更都提升 minor 版本。
 
+## Unreleased（计划 0.3.0，尚未打标签）
+
+- 购买成功回调与交易监听直接交付已验证权益：缓存可回读、可观察授权已发布之后才 finish；未验证/未知商品/缓存失败保留重投。
+- ID 与状态共用一次扫描；取消或被更新状态取代的扫描不提交。部分验证保留既有权益，不续写全局校验时间。
+- 完整快照缺失、退款和撤销清除终身授权；订阅历史继续保留。商品 catalog 以外的 ID 不授予 Pro。
+- 没有加载商品元数据也能交付订阅；宿主观察统一授权入口，避免只看商品 ID 的分裂状态。
+- 新增 [接入与防踩坑文档](docs/purchase-integration.md)，替换下面旧版本不正确的验证/finish 建议。
+- 回归测试直接覆盖生产交付与快照提交函数，宿主测试验证仍须按 DELIVERY 执行。
+
+## 0.2.1
+
+- 回前台改为非交互式权益刷新，不自动调用 `AppStore.sync()`。
+
 ## 0.2.0
 
 公共 API 未变；权益判定的**行为**变了两处，按策略提升 minor。
@@ -15,21 +28,11 @@
   单条 JWS 验证失败会当场抛出、退出整个 `for await`，把排在它前后的**已验证**购买一起丢掉，
   然后落到「按离线处理」的分支上靠缓存维持——缓存宽限期一过，持有有效订阅的用户就真的失去访问权限。
   丢多少还取决于坏交易在流里的位置，而顺序不由调用方决定。
-  现在逐条跳过：坏条目只丢它自己。策略见 `EntitlementVerification.verifiedOrSkipped`。
+  该版本改为逐条跳过，但仍把部分结果当完整结果；现已在 Unreleased 修正。
 
-  连带影响：`restoreEntitlementsSilently` 里那个 `catch → handleOfflineValidation()` 只可能由
-  `checkVerified` 触发（`currentEntitlements` 是不抛的 `AsyncStream`，真正离线时给出空序列而非错误），
-  也就是说「一条 JWS 验证不过」曾被当作「设备离线」。该分支随之移除；离线兜底仍由
-  `validatePurchasesWithFallback` 负责。
-
-- **未验证的交易不再永远重投。**
-  `Transaction.updates` 每次冷启动都会重投未 `finish()` 的交易，而 JWS 验证失败是这笔交易的
-  永久属性。过去验证失败只记日志、从不结束，等于每次启动都跑一遍必然失败的路径。
-  现在按商品类型分流（`EntitlementVerification.shouldFinishUnverified`）：
-  自动续订订阅与非消耗型**结束**它——权益还能从 `currentEntitlements` 再取回，丢了不亏；
-  消耗型与非续订订阅**保留**——它们不进 `currentEntitlements`，一旦 finish 就永久消失，
-  验证不过就丢会让用户付了钱拿不到东西。未来新增的商品类型默认落在「保留」一侧。
-  购买路径（`handlePurchaseResult`）同样处理，仍向调用方抛 `.failedVerification`。
+- 该版本曾对未验证的自动续订与非消耗型交易调用 finish。此策略现已撤回：
+  不能在未交付权益时结束交易，不能断言验证失败永远不可恢复。
+  同时纠正旧说明：空权益序列不等同离线；非续订订阅也在 `currentEntitlements` 的返回范围内。
 
 - **发行版日志不再走 stdout。** `StoreKitManager` 里 9 处无条件 `print` 改为 `os.Logger`
   （`subsystem: "PurchaseKit"`, `category: "Store"`），商品 ID 按 `.private` 打点，

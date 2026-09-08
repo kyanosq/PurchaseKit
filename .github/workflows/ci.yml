@@ -43,6 +43,7 @@ jobs:
             -only-testing:PurchaseKitTests/PricingFormatterTests \
             -only-testing:PurchaseKitTests/PurchaseCacheTests \
             -only-testing:PurchaseKitTests/EntitlementStateResolverTests \
+            -only-testing:PurchaseKitTests/EntitlementVerificationTests \
             -only-testing:PurchaseKitTests/StoreKitManagerRestorePurchasesTests \
             -only-testing:PurchaseKitTests/InAppPurchaseModelsTests \
             -only-testing:PurchaseKitTests/PromotionalOfferTests \

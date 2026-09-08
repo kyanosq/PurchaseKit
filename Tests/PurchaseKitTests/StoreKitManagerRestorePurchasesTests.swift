@@ -62,7 +62,7 @@ final class StoreKitManagerRestorePurchasesTests: XCTestCase {
     }
 
     func testRestorePurchases_AvoidsDuplicateEntitlementRefreshDuringStatusUpdate() async throws {
-        let cache = StickyHistoryPurchaseCache()
+        let cache = NonBlockingPurchaseCache()
         let service = CountingEntitlementsStoreKitService()
         let config = StoreKitConfiguration(
             namespace: "test.restore_calls." + UUID().uuidString,
@@ -88,7 +88,7 @@ final class StoreKitManagerRestorePurchasesTests: XCTestCase {
         try await manager.restorePurchases()
 
         let calls = await service.entitlementCallCount()
-        XCTAssertEqual(calls, 2, "restorePurchases 应只进行一次刷新 + 一次状态计算，避免重复刷新")
+        XCTAssertEqual(calls, 1, "恢复与状态计算共用同一次完整快照")
     }
 
     func testForceRefreshPurchases_KeepsExpiredStatusAfterOfflineFallback() async throws {
@@ -126,7 +126,7 @@ final class StoreKitManagerRestorePurchasesTests: XCTestCase {
     }
 
     func testForceRefreshPurchases_AvoidsDuplicateEntitlementRefreshDuringStatusUpdate() async throws {
-        let cache = StickyHistoryPurchaseCache()
+        let cache = NonBlockingPurchaseCache()
         let service = CountingEntitlementsStoreKitService()
         let config = StoreKitConfiguration(
             namespace: "test.force_refresh_calls." + UUID().uuidString,
@@ -152,7 +152,7 @@ final class StoreKitManagerRestorePurchasesTests: XCTestCase {
         await manager.forceRefreshPurchases()
 
         let calls = await service.entitlementCallCount()
-        XCTAssertEqual(calls, 2, "forceRefreshPurchases 应只进行一次刷新 + 一次状态计算，避免重复刷新")
+        XCTAssertEqual(calls, 1, "刷新与状态计算共用同一次完整快照")
     }
 
     func testReloadProducts_ForceRefreshesCatalogEvenWhenCalledRepeatedly() async throws {
@@ -810,7 +810,7 @@ private final class StickyHistoryPurchaseCache: PurchaseCacheProtocol {
 
 @available(iOS 17.0, macOS 14.0, watchOS 10.0, tvOS 17.0, *)
 private final class AlwaysCheckForegroundPurchaseCache: PurchaseCacheProtocol {
-    private var purchases: Set<String> = ["sub.monthly"]
+    private var purchases: Set<String> = ["stub.month"]
     private var status: UserSubscriptionStatus? = .activeSubscriber
     private var validationTime: Date?
     private var loginRejectionTime: Date?

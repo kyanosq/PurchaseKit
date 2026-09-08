@@ -47,7 +47,7 @@ PurchaseCatalog ──▶ StoreKitManager ◀── StoreKitServiceProtocol ◀�
 
 库区分两件事实：
 
-1. **当前已验证权益**：来自 `Transaction.currentEntitlements`，决定当前在线授权。
+1. **当前已验证权益**：来自已验证购买/交易更新或 `Transaction.currentEntitlements`，决定当前授权。
 2. **历史购买身份**：来自经过验证后写入的本地历史，用于区分新用户与过期 / 取消用户。
 
 - 当前权益为空时**不**清除历史购买身份。状态计算先处理 verified revocation，再处理当前订阅状态，
@@ -73,11 +73,23 @@ PurchaseCatalog ──▶ StoreKitManager ◀── StoreKitServiceProtocol ◀�
 - `PurchaseCache` 在目标 key 尚不存在时执行**一次性**旧 key 到 namespaced key 的迁移，
   仅复制已知旧 key、不覆盖新值；复制值可回读后才删除旧 key。
 - 缓存时间兼容历史上以 `Date` 或正数 epoch `Double`/`NSNumber` 写入的表示。
-- 订阅历史与终身买断证据是**可持久**的：与当前权益 ID 分离，仅累加、不在权益过期时抹除。
+- 订阅历史仅累加、不在权益过期时抹除。终身买断证据可持久，但已验证撤销或完整快照中缺失时必须清除。
 - 离线宽限期过期时，`clearVolatileCache()` 仅清理可挥发的访问证据（当前权益 ID、验证时间、缓存状态、
   登录 / 前台检查时间），**保留**订阅历史与终身证据——客户的购买身份不被一次过期的离线宽限抹除。
   完整重置仍由 `clearAllCache()` / `StoreKitManager.clearOfflineCache()` 负责。
 - 离线宽限仅适用于「上次已验证、且未出现撤销证据」的权益；验证失败与撤销不会授予权益。
+
+## 交付与刷新边界
+
+- 购买回调和交易监听复用同一交付函数：仅接受 catalog 内类型匹配的已验证交易，更新缓存并回读、发布授权后才 `finish()`。失败不能吞掉后照常结束交易。
+- 不结束未验证或未知商品交易，不以重投次数推定验证永远失败。
+- 刷新只枚举一次；取消和已被新状态取代的扫描不得提交。一个未验证条目不会丢掉其他已验证权益，但该扫描不再是完整快照，不删除既有授权或续写全局校验时间。
+- 完整空快照表示没有当前有效权益，清除当前 ID/终身标记，保留订阅历史；空结果不能直接等同离线。
+- `currentEntitlements` 中已验证的订阅也可能处于账单宽限期，不以过去的 `expirationDate` 单独拒绝；没有加载商品元数据时仍能交付当前授权。
+- `canAccessProFeatures()` / `proAccessState()` 是宿主唯一授权入口，支持 Observation；原始 ID、历史状态和缓存布尔值不单独授权。
+- 自定义 `PurchaseCacheProtocol` 必须实现写入后可回读的当前 ID。持久化失败不 finish，已验证退款在当前实例中仍立即拒绝访问。
+
+接入例子与错误展示见 [docs/purchase-integration.md](docs/purchase-integration.md)。
 
 ## 撤销（退款 / revoke）规则
 

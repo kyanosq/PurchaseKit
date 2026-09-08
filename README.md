@@ -47,7 +47,9 @@ dependencies: [
 ```
 
 > 版本 `0.1.1` 已在真实消费者通过 canonical checkout 验证后发布。
-> 在那之前，可指向本地路径或未打标签的 revision 试用。
+> 本次购买交付修复尚未打发布标签；验证修复时请固定包含修复的 Git revision，不能只保留旧的 Package.resolved。
+
+购买、恢复与防踩坑的完整接入方式见 [购买与权益接入](docs/purchase-integration.md)。
 
 ## 最小示例
 
