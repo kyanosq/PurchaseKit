@@ -42,12 +42,14 @@ https://github.com/kyanosq/PurchaseKit.git
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/kyanosq/PurchaseKit.git", from: "0.1.1")
+    .package(url: "https://github.com/kyanosq/PurchaseKit.git",
+             revision: "b5c4ee7b42e54207d4ee6fbaef1d51ebe0947dbb")
 ]
 ```
 
 > 版本 `0.1.1` 已在真实消费者通过 canonical checkout 验证后发布。
-> 本次购买交付修复尚未打发布标签；验证修复时请固定包含修复的 Git revision，不能只保留旧的 Package.resolved。
+> 上例固定本次交付修复的提交，尚未打发布标签。Xcode 中选择 Revision 并输入同一 SHA；
+> 更新 Package.resolved 后检查实际解析结果，不能只更新依赖范围而保留旧锁文件。
 
 购买、恢复与防踩坑的完整接入方式见 [购买与权益接入](docs/purchase-integration.md)。
 
