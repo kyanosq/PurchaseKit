@@ -18,7 +18,7 @@ iOS 17+ 环境上始终完整运行**：
 | `EntitlementStateResolverTests` | 过期订阅者、取消但仍有效、撤销、宽限、终身 |
 | `StoreKitManagerRestorePurchasesTests` | 恢复 / 强制刷新 / 缓存重置 / 任务生命周期 / 可持久证据穿越过期宽限 |
 | `PublicAPITests` | 公开配置与 manager 构造、源码契约（无不安全默认、无 no-op API、促销 fail-closed、**生产源码不含宿主面向文案 / 营销 UI 助手**） |
-| `EntitlementVerificationTests` | 逐条验证策略（一条坏条目不废掉整批、位置无关）与未验证交易的 `finish` 策略（按商品类型分流） |
+| `EntitlementVerificationTests` | 生产交付/快照提交路径：先授权再 finish、验证失败、部分结果、取消/过时刷新、退款、完整空快照与 Observation |
 | `StoreKitTestingPlatformTests` | StoreKit 集成探针的平台判据（toolchain/runtime/宿主组合），始终执行 |
 | `PrivacyManifestTests` | 自带 `PrivacyInfo.xcprivacy`：不跟踪 / 不收集数据 / 仅 UserDefaults + CA92.1；且 `Package.swift` 以 `.process` 声明该资源 |
 
@@ -78,7 +78,7 @@ xcodebuild -scheme PurchaseKit \
 swift test
 ```
 
-180 例、18 跳过（集成层）、0 失败，约 5 秒，不需要模拟器。跳过的是第二层——命令行测试进程
+用例数量以当前测试输出为准；18 个集成用例在无宿主命令行环境跳过，不需要模拟器。跳过的是第二层——命令行测试进程
 没有宿主 App，`storekitd` 不向无宿主进程下发 `.storekit` 配置，`Product.products` 必然为空。
 这是构建方式的结构性限制，由 `StoreKitTestingPlatform.outcome(…, hosted:)` 判定为 `.skipUnhosted`，
 与「真实回归」严格区分：**只有没有宿主、或受影响运行时 ∧ 受影响工具链这两种理由能换来跳过，

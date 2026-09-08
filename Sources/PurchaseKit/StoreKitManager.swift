@@ -77,6 +77,10 @@ public final class StoreKitManager {
     private let storeKitService: StoreKitServiceProtocol
     @ObservationIgnored private var promotionalOfferSigner: PromotionalOfferSigning?
     
+    // Invalidates suspended scans when another scan, delivery or reset supersedes them.
+    private var entitlementRevision = 0
+    private enum PersistenceError: Error { case writeFailed }
+
     // MARK: - Offline Purchase Protection
     
     private var lastValidPurchases: Set<String> {
@@ -103,17 +107,16 @@ public final class StoreKitManager {
     // MARK: - Entitlement facts (fed into EntitlementStateResolver)
 
     /// 最近一次已验证计算得到的“当前活跃订阅/试用/续订意图”快照。
-    /// 仅记录来自 `Transaction.currentEntitlements` 的已验证事实，不包含离线推测。
-    @ObservationIgnored private var entitlementHasActiveSubscription = false
-    @ObservationIgnored private var entitlementIsTrial = false
-    @ObservationIgnored private var entitlementWillAutoRenew = true
+    /// 来自当前权益或直接交易交付的已验证事实，不包含离线推测。
+    private var entitlementHasActiveSubscription = false
+    private var entitlementIsTrial = false
+    private var entitlementWillAutoRenew = true
     @ObservationIgnored private var renewalInfoVerified = false
 
-    /// 终身证据：持久标记或当前权益 ID 中仍含终身商品。终身证据不会关闭
+    /// 终身证据在启动时从缓存还原，随后仅由已提交的当前权益决定。它不会关闭
     /// 非交互式 `Transaction.currentEntitlements` 刷新或事务监听。
     private func hasDurableLifetime() -> Bool {
-        purchaseCache.hasLifetimeEntitlement()
-            || !lifetimePurchases(from: purchaseCache.getLastValidPurchases()).isEmpty
+        !lifetimePurchases(from: purchasedProductIDs).isEmpty
     }
 
     /// 经过验证后写入的订阅历史证据，与当前权益 ID 分离。
@@ -124,7 +127,7 @@ public final class StoreKitManager {
     /// 离线宽限证据：仅在仍在宽限期内、且本地仍有已验证购买记录时成立。
     private func hasOfflineEvidence() -> Bool {
         let protection = purchaseCache.getOfflineProtectionStatus(maxGracePeriod: config.maxOfflineGracePeriod)
-        return protection.isProtected && !purchaseCache.getLastValidPurchases().isEmpty
+        return protection.isProtected && !purchasedProductIDs.isDisjoint(with: catalog.subscriptionIDs.values)
     }
 
     /// 当前订阅是否自动续订。无法验证续订信息时不判为 cancelled（保持 activeSubscriber）。
@@ -245,7 +248,7 @@ public final class StoreKitManager {
     
     // MARK: - State restore
     private func restoreStateFromCache() {
-        let cachedPurchases = purchaseCache.getLastValidPurchases()
+        let cachedPurchases = purchaseCache.getLastValidPurchases().intersection(catalog.allProductIDs)
         let cachedLifetimePurchases = lifetimePurchases(from: cachedPurchases)
         let protection = purchaseCache.getOfflineProtectionStatus(maxGracePeriod: config.maxOfflineGracePeriod)
 
@@ -257,7 +260,7 @@ public final class StoreKitManager {
         let hasDurableLifetimeFlag = purchaseCache.hasLifetimeEntitlement()
 
         if !cachedPurchases.isEmpty && protection.isProtected {
-            purchasedProductIDs = cachedPurchases
+            purchasedProductIDs = hasDurableLifetimeFlag ? cachedPurchases.union(lifetimeProductIDSet) : cachedPurchases
             if !cachedLifetimePurchases.isEmpty || hasDurableLifetimeFlag {
                 userStatus = .activeSubscriber
             } else if let cachedStatus = purchaseCache.getCachedUserStatus() {
@@ -293,7 +296,7 @@ public final class StoreKitManager {
     private func seedDurableEvidence(from cachedPurchases: Set<String>) {
         guard !cachedPurchases.isEmpty else { return }
         let lifetimeIDs = lifetimePurchases(from: cachedPurchases)
-        let subscriptionIDs = cachedPurchases.subtracting(lifetimeIDs)
+        let subscriptionIDs = cachedPurchases.intersection(catalog.subscriptionIDs.values)
         if !subscriptionIDs.isEmpty {
             purchaseCache.recordSubscriptionHistory(subscriptionIDs)
         }
@@ -327,7 +330,7 @@ public final class StoreKitManager {
             let hours = Date().timeIntervalSince(lastValidation) / 3600
             if hours < 6 { return }
         }
-        let cachedPurchases = purchaseCache.getLastValidPurchases()
+        let cachedPurchases = purchaseCache.getLastValidPurchases().intersection(catalog.allProductIDs)
         guard !cachedPurchases.isEmpty else { return }
         lastForegroundCheckTime = Date()
         await forceRefreshPurchases()
@@ -337,6 +340,9 @@ public final class StoreKitManager {
         do {
             try await updateUserPurchases()
             await updateUserStatus(refreshPurchases: false)
+        } catch is CancellationError { return
+        } catch StoreError.failedVerification { return
+        } catch is PersistenceError { return
         } catch {
             let result = handleStoreKitError(error)
             if result.shouldFallbackToCache { await handleOfflineValidation() }
@@ -425,22 +431,32 @@ public final class StoreKitManager {
     }
 
     private func processTransactionUpdate(_ result: VerificationResult<Transaction>) async {
-        guard let transaction = await verifiedTransactionSettlingUnverified(result) else { return }
-        storeLog.info("Transaction update: \(transaction.productID, privacy: .private)")
-        if let revocationDate = transaction.revocationDate {
-            await handleRefundOrRevocation(transaction: transaction, revocationDate: revocationDate)
-        }
         do {
-            try await updateUserPurchases()
+            try await deliverTransaction(result.mapEntitlement()) {
+                if case .verified(let transaction) = result { await transaction.finish() }
+            }
         } catch {
-            let nsError = error as NSError
-            storeLog.error("Failed to refresh purchases after transaction update: domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public)")
+            storeLog.error("Transaction not delivered; left unfinished: \(String(describing: error), privacy: .public)")
         }
-        await updateUserStatus(refreshPurchases: false)
-        await transaction.finish()
     }
 
-    // MARK: - Verification
+    // The same delivery boundary is used by purchases and Transaction.updates.
+    // Finish only after the verified entitlement has been persisted and published.
+    func deliverTransaction(
+        _ result: Result<EntitlementTransaction, Error>,
+        finish: () async -> Void
+    ) async throws {
+        let entitlement = try result.get()
+        guard supports(entitlement) else { throw StoreError.productNotFound }
+        try applyEntitlements([entitlement], complete: false, currentSnapshot: false)
+        await finish()
+        if let revoked = entitlement.revocationDate {
+            NotificationCenter.default.post(name: .purchaseRefunded, object: self, userInfo: [
+                "productID": entitlement.productID, "revocationDate": revoked,
+                "revocationReason": entitlement.transaction?.revocationReason?.rawValue ?? "unknown"
+            ])
+        }
+    }
 
     private func checkVerified<T>(_ result: VerificationResult<T>) throws -> T {
         switch result {
@@ -449,149 +465,44 @@ public final class StoreKitManager {
         }
     }
 
-    /// 逐条验证权益：单条验证失败只丢弃那一条，不中断整条枚举。策略见
-    /// `EntitlementVerification.verifiedOrSkipped`。
-    private func verifiedOrSkipped<T>(_ result: VerificationResult<T>) -> T? {
-        if case .unverified(_, let error) = result {
-            storeLog.error("Skipping unverified entitlement: \(String(describing: error), privacy: .public)")
-        }
-        return EntitlementVerification.verifiedOrSkipped(result)
-    }
-
-    /// 事务更新流专用：验证失败时按 `EntitlementVerification.shouldFinishUnverified`
-    /// 决定是否结束这笔交易，然后丢弃它（绝不授予权益）。
-    private func verifiedTransactionSettlingUnverified(
-        _ result: VerificationResult<Transaction>
-    ) async -> Transaction? {
-        switch result {
-        case .verified(let safe):
-            return safe
-        case .unverified(let unsafeTransaction, let error):
-            storeLog.error("Unverified transaction \(unsafeTransaction.productID, privacy: .private): \(String(describing: error), privacy: .public)")
-            if EntitlementVerification.shouldFinishUnverified(unsafeTransaction.productType) {
-                await unsafeTransaction.finish()
-            }
-            return nil
-        }
-    }
-
-    // MARK: - Refund/revocation
-    private func handleRefundOrRevocation(transaction: Transaction, revocationDate: Date) async {
-        await MainActor.run {
-            // 已验证撤销：清除该商品的当前权益与离线宽限证据，确保 `.revoked` 不被离线缓存覆盖。
-            var cached = self.lastValidPurchases
-            cached.remove(transaction.productID)
-            self.lastValidPurchases = cached
-            self.purchasedProductIDs.remove(transaction.productID)
-            self.entitlementHasActiveSubscription = false
-            self.entitlementIsTrial = false
-            if transaction.productType == .autoRenewable {
-                self.activeTransaction = nil
-                // 标记为 revoked，使解析器在 accessState 中优先拒绝（即便存在离线证据）。
-                self.subscriptionGroupStatus = .revoked
-                self.userStatus = .expiredSubscriber
-            } else if transaction.productType == .nonConsumable {
-                if self.lifetimeProductIDSet.contains(transaction.productID) {
-                    self.purchaseCache.setLifetimeEntitlement(false)
-                }
-                if self.purchasedProductIDs.isEmpty { self.userStatus = .newUser }
-            }
-            NotificationCenter.default.post(
-                name: .purchaseRefunded,
-                object: self,
-                userInfo: [
-                    "productID": transaction.productID,
-                    "revocationDate": revocationDate,
-                    "revocationReason": transaction.revocationReason?.rawValue ?? "unknown"
-                ]
-            )
-        }
-    }
-    
     // MARK: - User status management
     private func updateUserStatus(refreshPurchases: Bool = true) async {
-        let cachedPurchases = purchaseCache.getLastValidPurchases()
-        if purchasedProductIDs.isEmpty && !cachedPurchases.isEmpty {
-            await MainActor.run { self.purchasedProductIDs = cachedPurchases }
-        }
         if refreshPurchases {
-            do { try await updateUserPurchases() } catch {
-                let result = handleStoreKitError(error)
-                if result.shouldFallbackToCache { await handleOfflineValidation(); return }
-            }
+            do { try await updateUserPurchases() } catch { return }
         }
-        // 先刷新订阅组状态（含 willAutoRenew / revoked），再以其作为解析器输入计算用户状态。
-        // 不再用“当前权益为空就早返回 newUser”的捷径——那会把有过订阅历史的用户误判为新用户。
+        let revision = entitlementRevision
         await updateSubscriptionGroupStatus()
-        await calculateUserStatusFromPurchases()
+        guard !Task.isCancelled, revision == entitlementRevision else { return }
+        calculateUserStatusFromPurchases()
         await updateOfferEligibility()
     }
-    
-    private func calculateUserStatusFromPurchases() async {
-        var hasActiveSubscription = false
-        var hasExpiredSubscription = false
-        var isInTrial = false
-        var seenLifetime = false
-        var activeSubTransaction: Transaction?
-        var observedSubscriptionIDs: Set<String> = []
-        // 不再包 do/catch：逐条验证后这个循环不会抛，原先的 catch 只可能由
-        // `checkVerified` 触发，而那正是"一条坏交易废掉整次刷新"的入口。
-        for await result in storeKitService.currentEntitlements() {
-            guard let transaction = verifiedOrSkipped(result) else { continue }
-            // 已验证的撤销交易不授予任何权益，也不进入历史/活跃快照。
-            if transaction.revocationDate != nil { continue }
-            if transaction.productType == .autoRenewable {
-                let isUnexpired = transaction.expirationDate.map { $0 > Date() } ?? true
-                if isUnexpired {
-                    hasActiveSubscription = true
-                    if activeSubTransaction == nil { activeSubTransaction = transaction }
-                    if let offerType = transaction.offerType, case .introductory = offerType { isInTrial = true }
-                    observedSubscriptionIDs.insert(transaction.productID)
-                } else {
-                    hasExpiredSubscription = true
-                }
-            }
-            if transaction.productType == .nonConsumable {
-                if lifetimeProductIDSet.contains(transaction.productID) {
-                    seenLifetime = true
-                }
-            }
-        }
-        await MainActor.run {
-            // 仅在未过期（或无过期时间）时保留活跃交易。
-            self.activeTransaction = activeSubTransaction
-            // 经过验证的订阅写入历史证据；终身写入持久权益标记。
-            if !observedSubscriptionIDs.isEmpty {
-                self.purchaseCache.recordSubscriptionHistory(observedSubscriptionIDs)
-            }
-            if seenLifetime {
-                self.purchaseCache.setLifetimeEntitlement(true)
-            }
-            let willAutoRenew = self.resolvedWillAutoRenew(hasActiveSubscription: hasActiveSubscription)
-            let facts = EntitlementFacts(
-                hasActiveSubscription: hasActiveSubscription,
-                hasLifetime: seenLifetime || self.hasDurableLifetime(),
-                isTrial: isInTrial,
-                willAutoRenew: willAutoRenew,
-                hadSubscriptionHistory: self.hadSubscriptionHistory(),
-                renewalState: self.subscriptionGroupStatus,
-                hasOfflineEvidence: false
-            )
-            self.entitlementHasActiveSubscription = facts.hasActiveSubscription
-            self.entitlementIsTrial = facts.isTrial
-            self.entitlementWillAutoRenew = facts.willAutoRenew
-            // 当前权益为空时不能抹掉历史购买身份：由解析器区分 expiredSubscriber 与 newUser。
-            self.userStatus = EntitlementStateResolver.userStatus(from: facts)
-            _ = hasExpiredSubscription
-            self.saveCachedUserStatus()
-        }
+
+    private func calculateUserStatusFromPurchases() {
+        let facts = EntitlementFacts(
+            hasActiveSubscription: entitlementHasActiveSubscription,
+            hasLifetime: hasDurableLifetime(),
+            isTrial: entitlementIsTrial,
+            willAutoRenew: resolvedWillAutoRenew(hasActiveSubscription: entitlementHasActiveSubscription),
+            hadSubscriptionHistory: hadSubscriptionHistory(),
+            renewalState: subscriptionGroupStatus,
+            hasOfflineEvidence: hasOfflineEvidence()
+        )
+        userStatus = EntitlementStateResolver.userStatus(from: facts)
+        saveCachedUserStatus()
     }
-    
+
     private func updateSubscriptionGroupStatus() async {
         guard let subscription = products.first(where: { $0.type == .autoRenewable })?.subscription else { return }
+        let revision = entitlementRevision
         do {
             let statuses = try await subscription.status
-            let prioritized = statuses.max { lhs, rhs in
+            guard !Task.isCancelled, revision == entitlementRevision else { return }
+            let verifiedStatuses = statuses.filter {
+                if case .verified = $0.transaction, case .verified = $0.renewalInfo { return true }
+                return false
+            }
+            guard !verifiedStatuses.isEmpty else { return }
+            let prioritized = verifiedStatuses.max { lhs, rhs in
                 renewalStatePriority(mapRenewalState(lhs.state)) < renewalStatePriority(mapRenewalState(rhs.state))
             }
             let state = prioritized.map { mapRenewalState($0.state) } ?? .expired
@@ -599,19 +510,14 @@ public final class StoreKitManager {
             if let chosen = prioritized {
                 do {
                     let renewalInfo = try checkVerified(chosen.renewalInfo)
-                    await MainActor.run {
-                        self.subscriptionGroupStatus = state
-                        self.entitlementWillAutoRenew = renewalInfo.willAutoRenew
-                        self.renewalInfoVerified = true
-                    }
+                    self.subscriptionGroupStatus = state
+                    self.entitlementWillAutoRenew = renewalInfo.willAutoRenew
+                    self.renewalInfoVerified = true
                 } catch {
-                    await MainActor.run {
-                        self.subscriptionGroupStatus = state
-                        self.renewalInfoVerified = false
-                    }
+                    self.renewalInfoVerified = false
                 }
             } else {
-                await MainActor.run { self.subscriptionGroupStatus = state }
+                self.subscriptionGroupStatus = state
             }
         } catch { storeLog.error("Failed to update subscription group status: \(String(describing: error), privacy: .public)") }
     }
@@ -650,21 +556,100 @@ public final class StoreKitManager {
     
     private func updateUserPurchases() async throws {
         if isInLoginCooldown { throw StoreError.userCancelled }
-        var purchased: Set<String> = []
-        for await result in storeKitService.currentEntitlements() {
-            guard let transaction = verifiedOrSkipped(result) else { continue }
-            if transaction.revocationDate == nil { purchased.insert(transaction.productID) }
+        try await refreshEntitlements(from: storeKitService.currentEntitlements().map { $0.mapEntitlement() })
+    }
+
+    func refreshEntitlements<S: AsyncSequence>(from stream: S) async throws
+    where S.Element == Result<EntitlementTransaction, Error> {
+        try Task.checkCancellation()
+        entitlementRevision += 1
+        let revision = entitlementRevision
+        var verified: [EntitlementTransaction] = []
+        var complete = true
+        for try await result in stream {
+            try Task.checkCancellation()
+            switch result {
+            case .success(let transaction): verified.append(transaction)
+            case .failure: complete = false
+            }
         }
-        await MainActor.run {
-            self.lastValidPurchases = purchased
-            self.lastValidationTime = Date()
-            self.purchasedProductIDs = purchased
+        try Task.checkCancellation()
+        guard revision == entitlementRevision else { throw CancellationError() }
+        try applyEntitlements(verified, complete: complete, currentSnapshot: true)
+        // A partial result may add verified rights, but cannot prove other rights absent.
+        if !complete { throw StoreError.failedVerification }
+    }
+
+    private func supports(_ item: EntitlementTransaction) -> Bool {
+        switch item.productType {
+        case .autoRenewable: return catalog.subscriptionIDs.values.contains(item.productID)
+        case .nonConsumable: return lifetimeProductIDSet.contains(item.productID)
+        default: return false
         }
     }
-    
+
+    private func applyEntitlements(
+        _ items: [EntitlementTransaction], complete: Bool, currentSnapshot: Bool
+    ) throws {
+        entitlementRevision += 1
+        var purchased = complete ? [] : purchasedProductIDs.intersection(catalog.allProductIDs)
+        var active = complete ? nil : activeTransaction
+        var trial = complete ? false : entitlementIsTrial
+        var verifiedSubscriptionIDs = !complete && entitlementHasActiveSubscription
+            ? purchasedProductIDs.intersection(catalog.subscriptionIDs.values) : []
+        var revokedSubscription = false
+        for item in items where supports(item) {
+            let expired = item.expirationDate.map { $0 <= Date() } ?? false
+            if item.revocationDate != nil || item.isUpgraded || (!currentSnapshot && expired) {
+                purchased.remove(item.productID)
+                if item.productType == .autoRenewable {
+                    verifiedSubscriptionIDs.remove(item.productID)
+                    if active?.productID == item.productID { active = nil }
+                    revokedSubscription = revokedSubscription || item.revocationDate != nil
+                }
+                continue
+            }
+            purchased.insert(item.productID)
+            if item.productType == .autoRenewable {
+                verifiedSubscriptionIDs.insert(item.productID)
+                trial = item.isTrial
+                active = expired ? nil : item.transaction
+                purchaseCache.recordSubscriptionHistory([item.productID])
+            }
+        }
+        let hasSubscription = !verifiedSubscriptionIDs.isEmpty
+        if !hasSubscription { trial = false }
+        // Persist before acknowledging delivery. A failed cache must leave the transaction retryable.
+        purchaseCache.setLastValidPurchases(purchased)
+        let lifetime = !lifetimePurchases(from: purchased).isEmpty
+        purchaseCache.setLifetimeEntitlement(lifetime)
+        let persisted = purchaseCache.getLastValidPurchases() == purchased
+            && (lifetime || !purchaseCache.hasLifetimeEntitlement())
+        if persisted && (complete || (!currentSnapshot && hasSubscription)) { lastValidationTime = Date() }
+        purchasedProductIDs = purchased
+        activeTransaction = active
+        entitlementHasActiveSubscription = hasSubscription
+        entitlementIsTrial = trial
+        if hasSubscription {
+            // currentEntitlements also includes subscriptions in billing grace; no product fetch is needed to grant.
+            subscriptionGroupStatus = .subscribed
+        } else if revokedSubscription {
+            subscriptionGroupStatus = .revoked
+        } else if complete {
+            subscriptionGroupStatus = .expired
+        }
+        calculateUserStatusFromPurchases()
+        guard persisted else { throw PersistenceError.writeFailed }
+    }
+
     private func handleOfflineValidation() async {
-        await MainActor.run {
-            let cachedPurchases = purchaseCache.getLastValidPurchases()
+        guard !Task.isCancelled else { return }
+        entitlementRevision += 1
+        entitlementHasActiveSubscription = false
+        entitlementIsTrial = false
+        activeTransaction = nil
+        do {
+            let cachedPurchases = purchaseCache.getLastValidPurchases().intersection(catalog.allProductIDs)
             let cachedLifetimePurchases = lifetimePurchases(from: cachedPurchases)
             let cachedStatus = purchaseCache.getCachedUserStatus()
             let hadPurchaseHistory = !cachedPurchases.isEmpty || (cachedStatus != nil && cachedStatus != .newUser)
@@ -698,28 +683,15 @@ public final class StoreKitManager {
     
     // MARK: - Public API
     public func restoreEntitlementsSilently() async {
-        var purchasedProducts: Set<String> = []
-        // 原先这里的 catch → `handleOfflineValidation()` 只可能被 `checkVerified` 触发：
-        // `currentEntitlements` 是不抛的 AsyncStream，真正离线时它给出空序列而不是错误。
-        // 也就是说"一条 JWS 验证不过"曾被当成"设备离线"，整个账号退回缓存状态。
-        // 逐条跳过后这条路径不再存在，离线兜底仍由 `validatePurchasesWithFallback` 负责。
-        for await result in storeKitService.currentEntitlements() {
-            guard let transaction = verifiedOrSkipped(result) else { continue }
-            if transaction.revocationDate == nil {
-                purchasedProducts.insert(transaction.productID)
-            }
+        do {
+            try await updateUserPurchases()
+            await updateUserStatus(refreshPurchases: false)
+        } catch {
+            // Cancellation and incomplete verification must not replace the last committed snapshot.
+            storeLog.info("Silent entitlement refresh did not complete: \(String(describing: error), privacy: .public)")
         }
-        await MainActor.run {
-            self.purchasedProductIDs = purchasedProducts
-            self.lastValidPurchases = purchasedProducts
-            self.lastValidationTime = Date()
-        }
-        // 先刷新订阅组状态，再经解析器计算用户状态与活跃交易（仅在未过期时保留）。
-        await updateSubscriptionGroupStatus()
-        await calculateUserStatusFromPurchases()
-        await updateOfferEligibility()
     }
-    
+
     public func checkUserEligibility() async -> UserOfferEligibility {
         await updateOfferEligibility()
         switch userStatus {
@@ -833,6 +805,9 @@ public final class StoreKitManager {
         do {
             try await updateUserPurchases()
             await updateUserStatus(refreshPurchases: false)
+        } catch is CancellationError { return
+        } catch StoreError.failedVerification { return
+        } catch is PersistenceError { return
         } catch {
             await handleOfflineValidation()
         }
@@ -859,6 +834,7 @@ public final class StoreKitManager {
     /// 同步清空持久化缓存与全部内存权益状态。manager 为 @MainActor，直接在当前上下文重置，
     /// 不派发新任务，确保调用返回后状态立即一致。
     public func clearOfflineCache() {
+        entitlementRevision += 1
         purchaseCache.clearAllCache()
         purchasedProductIDs = []
         userStatus = .newUser
@@ -1058,6 +1034,7 @@ public final class StoreKitManager {
     public func hasValidSubscription() -> Bool { userStatus == .activeSubscriber || userStatus == .trialUser }
     
     public func proAccessState() -> ProAccessState {
+        _ = entitlementRevision // Track cache-backed changes through Observation as well.
         // 经纯函数解析器决定访问状态：撤销永远拒绝且优先于离线宽限；终身证据优先。
         let facts = EntitlementFacts(
             hasActiveSubscription: entitlementHasActiveSubscription,
@@ -1135,19 +1112,9 @@ public final class StoreKitManager {
     private func handlePurchaseResult(_ result: Product.PurchaseResult) async throws {
         switch result {
         case .success(let verification):
-            // 验证不过时同样要结束这笔交易再抛错：否则它会留在 `Transaction.updates` 里，
-            // 每次冷启动重投一遍必然失败的验证。用户仍会看到失败提示（`.failedVerification`）。
-            guard let transaction = await verifiedTransactionSettlingUnverified(verification) else {
-                throw StoreError.failedVerification
+            try await deliverTransaction(verification.mapEntitlement()) {
+                if case .verified(let transaction) = verification { await transaction.finish() }
             }
-            do {
-                try await updateUserPurchases()
-            } catch {
-                let nsError = error as NSError
-                storeLog.error("Failed to refresh purchases after successful purchase: domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public)")
-            }
-            await updateUserStatus(refreshPurchases: false)
-            await transaction.finish()
         case .userCancelled: throw StoreError.userCancelled
         case .pending: throw StoreError.pending
         @unknown default: throw StoreError.unknown

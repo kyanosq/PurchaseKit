@@ -1,90 +1,206 @@
 import XCTest
 import StoreKit
+import Observation
 @testable import PurchaseKit
 
-/// 两条验证策略的回归测试。
-///
-/// `Transaction` 在单元测试里造不出来（它只能由 StoreKit 签发），所以这里测的是
-/// **策略本身**，用 `VerificationResult<Int>` 承载。策略与调用点之间只隔一行，
-/// 调用点的正确性由 `StoreKitManagerRestorePurchasesTests` 与集成层覆盖。
-@available(iOS 17.0, macOS 14.0, watchOS 10.0, tvOS 17.0, *)
+@MainActor
 final class EntitlementVerificationTests: XCTestCase {
+    private var defaults: UserDefaults!
+    private var suite: String!
+    private var cache: PurchaseCache!
+    private var manager: StoreKitManager!
+    private let lifetime = "stub.lifetime"
+    private let monthly = "stub.month"
 
-    // MARK: - 一条坏条目不该废掉整批
-
-    /// 这条是修复前会失败的那条：旧实现在坏条目上 `throw`，整个 `for await` 当场退出，
-    /// 排在它前面的 1 和后面的 3 一起丢——用户手里两笔已验证的购买凭空消失。
-    func testABadEntryInTheMiddleDoesNotTakeItsNeighboursDown() {
-        let batch: [VerificationResult<Int>] = [
-            .verified(1),
-            .unverified(2, .invalidSignature),
-            .verified(3)
-        ]
-
-        XCTAssertEqual(EntitlementVerification.collectVerified(batch), [1, 3])
+    override func setUp() async throws {
+        suite = "delivery." + UUID().uuidString
+        defaults = UserDefaults(suiteName: suite)!
+        let config = StoreKitConfiguration(namespace: suite, storeKitInitDelay: 3600)
+        cache = PurchaseCache(userDefaults: defaults, config: config)
+        manager = StoreKitManager(catalog: .stub, config: config, purchaseCache: cache)
     }
 
-    /// 坏条目排在最前时，旧实现一条都收不到。这是同一个 bug 最刺眼的形态：
-    /// 结果取决于坏交易在流里的位置，而流的顺序不由我们决定。
-    func testTheOutcomeDoesNotDependOnWhereTheBadEntrySits() {
-        let leading: [VerificationResult<Int>] = [
-            .unverified(0, .invalidSignature), .verified(1), .verified(2)
-        ]
-        let trailing: [VerificationResult<Int>] = [
-            .verified(1), .verified(2), .unverified(0, .invalidSignature)
-        ]
-
-        XCTAssertEqual(EntitlementVerification.collectVerified(leading), [1, 2])
-        XCTAssertEqual(EntitlementVerification.collectVerified(trailing), [1, 2])
+    override func tearDown() async throws {
+        manager = nil
+        defaults.removePersistentDomain(forName: suite)
     }
 
-    func testEveryVerificationFailureModeIsSkippedNotTrusted() {
-        let failures: [VerificationResult<Int>.VerificationError] = [
-            .invalidSignature,
-            .invalidCertificateChain,
-            .revokedCertificate,
-            .invalidDeviceVerification
-        ]
+    private func scan(_ results: [Result<EntitlementTransaction, Error>]) async throws {
+        try await manager.refreshEntitlements(from: AsyncStream { continuation in
+            results.forEach { continuation.yield($0) }
+            continuation.finish()
+        })
+    }
 
-        for failure in failures {
-            XCTAssertNil(
-                EntitlementVerification.verifiedOrSkipped(VerificationResult<Int>.unverified(7, failure)),
-                "\(failure) 不得放行未验证的载荷"
-            )
+    func testLifetimeDeliveryPersistsAndPublishesBeforeFinishWithoutRescan() async throws {
+        var finished = false
+        try await manager.deliverTransaction(.success(.init(productID: lifetime, productType: .nonConsumable))) {
+            XCTAssertTrue(self.manager.canAccessProFeatures())
+            XCTAssertEqual(self.manager.purchasedProductIDs, [self.lifetime])
+            XCTAssertEqual(self.cache.getLastValidPurchases(), [self.lifetime])
+            XCTAssertTrue(self.cache.hasLifetimeEntitlement())
+            finished = true
+        }
+        XCTAssertTrue(finished)
+    }
+
+    func testSubscriptionDeliveryWorksBeforeProductsLoad() async throws {
+        try await manager.deliverTransaction(.success(.init(productID: monthly, productType: .autoRenewable, expirationDate: .distantFuture))) {
+            XCTAssertTrue(self.manager.canAccessProFeatures())
+            XCTAssertTrue(self.cache.getSubscriptionHistory().contains(self.monthly))
         }
     }
 
-    func testAVerifiedEntryPassesThroughUnchanged() {
-        XCTAssertEqual(EntitlementVerification.verifiedOrSkipped(VerificationResult<Int>.verified(42)), 42)
+    func testUnverifiedTransactionNeverGrantsOrFinishes() async {
+        do {
+            do {
+                try await manager.deliverTransaction(.failure(StoreError.failedVerification)) {
+                    XCTFail("Unverified transaction must remain unfinished")
+                }
+                XCTFail("Verification failure must reach the caller")
+            } catch StoreError.failedVerification {} catch { XCTFail("Unexpected error: \(error)") }
+            XCTAssertFalse(manager.canAccessProFeatures())
+        }
     }
 
-    func testAnAllBadBatchYieldsNothingRatherThanTrustingAnything() {
-        let batch: [VerificationResult<Int>] = [
-            .unverified(1, .invalidSignature),
-            .unverified(2, .revokedCertificate)
-        ]
-
-        XCTAssertTrue(EntitlementVerification.collectVerified(batch).isEmpty)
+    func testUnknownProductNeverGrantsOrFinishes() async {
+        do {
+            try await manager.deliverTransaction(.success(.init(productID: "other.app.lifetime", productType: .nonConsumable))) { XCTFail("Unknown product") }
+            XCTFail("Expected productNotFound")
+        } catch StoreError.productNotFound {} catch { XCTFail("\(error)") }
+        XCTAssertFalse(manager.canAccessProFeatures())
     }
 
-    // MARK: - 未验证交易的 finish 策略
-
-    /// 可从 `currentEntitlements` 再次取回的类型：结束它，否则 `Transaction.updates`
-    /// 每次冷启动都会重投一笔永远验证不过的交易。
-    func testRecoverableProductTypesAreFinishedSoTheyStopComingBack() {
-        XCTAssertTrue(EntitlementVerification.shouldFinishUnverified(.autoRenewable))
-        XCTAssertTrue(EntitlementVerification.shouldFinishUnverified(.nonConsumable))
+    func testPartialScanKeepsPriorRightsAndAcceptsVerifiedNeighboursWithoutRenewingCache() async throws {
+        try await scan([.success(.init(productID: lifetime, productType: .nonConsumable))])
+        let validated = cache.getLastValidationTime()
+        do {
+            try await scan([
+                .failure(StoreError.failedVerification),
+                .success(.init(productID: monthly, productType: .autoRenewable, expirationDate: .distantFuture))
+            ])
+            XCTFail("Partial verification must be reported")
+        } catch StoreError.failedVerification {}
+        XCTAssertEqual(manager.purchasedProductIDs, [lifetime, monthly])
+        XCTAssertEqual(cache.getLastValidationTime(), validated)
+        XCTAssertTrue(manager.canAccessProFeatures())
     }
 
-    /// 不可再取回的类型：留着。finish 一笔没验过的消耗型交易 = 用户付了钱、货没了、
-    /// 也没有任何痕迹可以追。宁可让它一直重投，等一个人来看。
-    func testUnrecoverableProductTypesAreKeptSoNobodyLosesWhatTheyPaidFor() {
-        XCTAssertFalse(EntitlementVerification.shouldFinishUnverified(.consumable))
-        XCTAssertFalse(EntitlementVerification.shouldFinishUnverified(.nonRenewable))
+    func testCompleteEmptySnapshotClearsLifetimeButRetainsSubscriptionHistory() async throws {
+        try await scan([
+            .success(.init(productID: lifetime, productType: .nonConsumable)),
+            .success(.init(productID: monthly, productType: .autoRenewable))
+        ])
+        try await scan([])
+        XCTAssertFalse(manager.canAccessProFeatures())
+        XCTAssertFalse(cache.hasLifetimeEntitlement())
+        XCTAssertTrue(manager.purchasedProductIDs.isEmpty)
+        XCTAssertEqual(manager.userStatus, .expiredSubscriber)
     }
 
-    /// 未来 StoreKit 新增商品类型时，默认落到「不结束」一侧——保守的那一侧是不销毁凭据。
-    func testAnUnknownFutureProductTypeDefaultsToKeepingTheTransaction() {
-        XCTAssertFalse(EntitlementVerification.shouldFinishUnverified(Product.ProductType(rawValue: "SomethingNew")))
+    func testVerifiedRevocationWinsEvenInPartialScan() async throws {
+        try await scan([.success(.init(productID: lifetime, productType: .nonConsumable))])
+        do {
+            try await scan([
+                .success(.init(productID: lifetime, productType: .nonConsumable, revocationDate: Date())),
+                .failure(StoreError.failedVerification)
+            ])
+            XCTFail("Partial verification must be reported")
+        } catch StoreError.failedVerification {}
+        XCTAssertFalse(manager.canAccessProFeatures())
+        XCTAssertFalse(cache.hasLifetimeEntitlement())
+    }
+
+    func testOldScanCannotOverwriteNewPurchase() async throws {
+        let (stream, continuation) = AsyncStream<Result<EntitlementTransaction, Error>>.makeStream()
+        let started = expectation(description: "scan started")
+        let scan = Task {
+            try await manager.refreshEntitlements(from: stream.map { result in
+                started.fulfill()
+                return result
+            })
+        }
+        continuation.yield(.success(.init(productID: "ignored", productType: .consumable)))
+        await fulfillment(of: [started], timeout: 5)
+        try await manager.deliverTransaction(.success(.init(productID: lifetime, productType: .nonConsumable))) {}
+        continuation.finish()
+        do { try await scan.value; XCTFail("Superseded scan must be discarded") }
+        catch is CancellationError {}
+        XCTAssertTrue(manager.canAccessProFeatures())
+        XCTAssertEqual(manager.purchasedProductIDs, [lifetime])
+    }
+
+    func testClearCacheInvalidatesSuspendedScan() async throws {
+        let (stream, continuation) = AsyncStream<Result<EntitlementTransaction, Error>>.makeStream()
+        let started = expectation(description: "scan started")
+        let scan = Task {
+            try await manager.refreshEntitlements(from: stream.map { result in
+                started.fulfill()
+                return result
+            })
+        }
+        continuation.yield(.success(.init(productID: lifetime, productType: .nonConsumable)))
+        await fulfillment(of: [started], timeout: 5)
+        manager.clearOfflineCache()
+        continuation.finish()
+        do { try await scan.value; XCTFail("Reset must invalidate scan") } catch is CancellationError {}
+        XCTAssertFalse(manager.canAccessProFeatures())
+    }
+
+    func testRevocationPublishesDenialBeforeFinish() async throws {
+        try await scan([.success(.init(productID: monthly, productType: .autoRenewable))])
+        try await manager.deliverTransaction(.success(.init(productID: monthly, productType: .autoRenewable, revocationDate: Date()))) {
+            XCTAssertFalse(self.manager.canAccessProFeatures())
+            XCTAssertTrue(self.cache.getLastValidPurchases().isEmpty)
+        }
+    }
+
+    func testRevokedOldPlanDoesNotEraseAnotherVerifiedSubscription() async throws {
+        try await scan([
+            .success(.init(productID: "stub.year", productType: .autoRenewable, expirationDate: .distantFuture)),
+            .success(.init(productID: monthly, productType: .autoRenewable, revocationDate: Date()))
+        ])
+        XCTAssertEqual(manager.purchasedProductIDs, ["stub.year"])
+        XCTAssertTrue(manager.canAccessProFeatures())
+    }
+
+    func testCacheWriteFailureLeavesPurchaseUnfinishedAndRevocationDenied() async throws {
+        let failingDefaults = DroppingWritesDefaults(suiteName: suite)!
+        let config = StoreKitConfiguration(namespace: suite, storeKitInitDelay: 3600)
+        let failingCache = PurchaseCache(userDefaults: failingDefaults, config: config)
+        let store = StoreKitManager(catalog: .stub, config: config, purchaseCache: failingCache)
+        failingDefaults.dropWrites = true
+        do {
+            try await store.deliverTransaction(.success(.init(productID: lifetime, productType: .nonConsumable))) {
+                XCTFail("An unpersisted purchase must not be finished")
+            }
+            XCTFail("Persistence failure must reach caller")
+        } catch {}
+        failingDefaults.dropWrites = false
+        try await store.deliverTransaction(.success(.init(productID: lifetime, productType: .nonConsumable))) {}
+        failingDefaults.dropWrites = true
+        do {
+            try await store.deliverTransaction(.success(.init(productID: lifetime, productType: .nonConsumable, revocationDate: Date()))) {
+                XCTFail("A failed revocation write must remain retryable")
+            }
+            XCTFail("Expected persistence error")
+        } catch {}
+        XCTAssertFalse(store.canAccessProFeatures(), "A stale lifetime flag must not override a verified refund")
+        XCTAssertTrue(failingCache.hasLifetimeEntitlement(), "The test must actually simulate a stale persistent flag")
+    }
+
+    func testAccessObservationSeesCacheBackedLifetimeChanges() async throws {
+        let changed = expectation(description: "access changes")
+        withObservationTracking { _ = manager.canAccessProFeatures() } onChange: { changed.fulfill() }
+        try await manager.deliverTransaction(.success(.init(productID: lifetime, productType: .nonConsumable))) {}
+        await fulfillment(of: [changed], timeout: 5)
+        XCTAssertTrue(manager.canAccessProFeatures())
+    }
+}
+
+private final class DroppingWritesDefaults: UserDefaults, @unchecked Sendable {
+    var dropWrites = false
+    override func set(_ value: Any?, forKey key: String) {
+        if !dropWrites { super.set(value, forKey: key) }
     }
 }
